@@ -24,8 +24,13 @@ jobs:
         run: |
           cp utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 "$RUNNER_TEMP/pagination-tests.ps1"
           git switch -c fix/release-compare-pages 7ef9501d7de9804ddb9d6013af6b665cccfb39d9
-          mkdir -p utils/workflow/Tests
-          cp "$RUNNER_TEMP/pagination-tests.ps1" utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          source = (Path(os.environ['RUNNER_TEMP']) / 'pagination-tests.ps1').read_text()
+          source = source.replace("'../New-ReleaseNotes.ps1'", "'../../utils/workflow/New-ReleaseNotes.ps1'")
+          Path('Testing/workflow/ReleaseNotesPagination.Tests.ps1').write_text(source)
+          PY
       - name: Install test tools
         shell: pwsh
         run: |
@@ -36,10 +41,11 @@ jobs:
         shell: pwsh
         run: |
           Import-Module Pester -RequiredVersion 5.7.1
-          $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
-          if ($Result.FailedCount -lt 2 -or $Result.PassedCount -lt 4) {
+          $Result = Invoke-Pester -Path Testing/workflow/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
+          if ($Result.FailedCount -ne 2 -or $Result.PassedCount -ne 5) {
               throw "Unexpected baseline outcome: $($Result.FailedCount) failures, $($Result.PassedCount) passes"
           }
+          $global:LASTEXITCODE = 0
       - name: Apply pagination fix
         shell: bash
         run: |
@@ -64,15 +70,15 @@ jobs:
           assert source.count(old) == 1
           p.write_text(source.replace(old, '    foreach ($Commit in $Commits) {', 1))
           PY
-      - name: Run regression tests and compare analyzer findings
+      - name: Run regression and existing release tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Import-Module Pester -RequiredVersion 5.7.1
           $PSVersionTable.PSVersion
-          $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
-          if ($Result.FailedCount -ne 0 -or $Result.PassedCount -ne 7) { throw 'Regression tests failed' }
-          $Findings = @(Invoke-ScriptAnalyzer -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -Severity Error,Warning)
+          $Result = Invoke-Pester -Path Testing/workflow/ReleaseNotesPagination.Tests.ps1,Testing/workflow/New-ReleaseNotes.Tests.ps1 -PassThru -Output Detailed
+          if ($Result.FailedCount -ne 0 -or $Result.PassedCount -ne 26) { throw 'Release-note tests failed' }
+          $Findings = @(Invoke-ScriptAnalyzer -Path Testing/workflow/ReleaseNotesPagination.Tests.ps1 -Severity Error,Warning)
           if ($Findings.Count) { $Findings | Format-List; throw 'New test analyzer findings' }
           git show 7ef9501d7de9804ddb9d6013af6b665cccfb39d9:utils/workflow/New-ReleaseNotes.ps1 | Set-Content "$env:RUNNER_TEMP/OriginalReleaseNotes.ps1"
           $Before = @(Invoke-ScriptAnalyzer "$env:RUNNER_TEMP/OriginalReleaseNotes.ps1" -Severity Error,Warning | ForEach-Object { "$($_.RuleName):$($_.Message)" } | Sort-Object)
@@ -88,14 +94,14 @@ jobs:
           Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
           Import-Module Pester -RequiredVersion 5.7.1
           $PSVersionTable.PSVersion
-          $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
-          if ($Result.FailedCount -ne 0 -or $Result.PassedCount -ne 7) { throw 'PowerShell 5.1 regression tests failed' }
+          $Result = Invoke-Pester -Path Testing/workflow/ReleaseNotesPagination.Tests.ps1,Testing/workflow/New-ReleaseNotes.Tests.ps1 -PassThru -Output Detailed
+          if ($Result.FailedCount -ne 0 -or $Result.PassedCount -ne 26) { throw 'PowerShell 5.1 release-note tests failed' }
       - name: Publish clean tested branch
         if: runner.os == 'Linux'
         shell: bash
         run: |
           git diff --check
-          git add utils/workflow/New-ReleaseNotes.ps1 utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1
+          git add utils/workflow/New-ReleaseNotes.ps1 Testing/workflow/ReleaseNotesPagination.Tests.ps1
           git config user.name 'Sylvester Kaczmarek'
           git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
           git commit -s -m 'Include every comparison page in release notes'
