@@ -32,9 +32,16 @@ jobs:
           result=$?
           set -e
           cat "$RUNNER_TEMP/before.log"
-          test "$result" -eq 2
-          grep -q 'test_PimRoleExclusions_User: FAIL' "$RUNNER_TEMP/before.log"
-          grep -q 'test_PimRoleExclusions_Group: FAIL' "$RUNNER_TEMP/before.log"
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', (Path(os.environ['RUNNER_TEMP']) / 'before.log').read_text())
+          for name in ['User', 'Group']:
+              assert re.search(r'test_PimRoleExclusions_' + name + r':\s*FAIL\b', text), text
+          assert 'PASS:' in text, text
+          PY
+          opa eval --format pretty -d "$MODULE_ROOT/Rego" -d "$MODULE_ROOT/Testing/Unit/Rego/AAD" 'data.aad_test.PimPolicyResult([{"DisplayName":"Global Administrator","Assignments":[{"PrincipalId":"example","StartDateTime":"2026-09-09T00:00:00Z"}]}], {})'
       - name: Apply policy and configuration changes
         run: |
           python3 - <<'PY'
@@ -68,7 +75,7 @@ jobs:
           assert s.count(marker) == 1
           p.write_text(s.replace(marker, marker + '\n<!--ExclusionType: RoleExclusions-->'))
           p = root / 'schemas/ScubaBaselines.json'
-          s = p.read_text(encoding='utf-8-sig')
+          s = p.read_text(encoding='utf-8')
           pattern = r'("id":\s*"MS\.AAD\.7\.5v1".*?"exclusionField":\s*)"none"'
           s, count = re.subn(pattern, r'\1"RoleExclusions"', s, count=1, flags=re.S)
           assert count == 1, count
@@ -102,7 +109,12 @@ jobs:
           s = p.read_text()
           old = '- MS.AAD.7.4v1\n'
           assert s.count(old) == 1
-          new = old + '- MS.AAD.7.5v1\n\nFor `MS.AAD.7.5v1`, use the same `RoleExclusions.Users` and `RoleExclusions.Groups` structure shown above, under the `MS.AAD.7.5v1` key. Exclusions are scoped to each policy and match the assigned user or group ID. An exclusion for one assignment does not exempt other assignments to the same role.\n'
+          new = (old + '- MS.AAD.7.5v1\n\n'
+                 'For `MS.AAD.7.5v1`, use the same `RoleExclusions.Users` and\n'
+                 '`RoleExclusions.Groups` structure shown above, under the `MS.AAD.7.5v1`\n'
+                 'key. Exclusions are scoped to each policy and match the assigned user or\n'
+                 'group ID. An exclusion for one assignment does not exempt other\n'
+                 'assignments to the same role.\n')
           p.write_text(s.replace(old, new))
           p = root / 'Testing/Unit/PowerShell/Support/New-SCuBAConfig.Tests.ps1'
           s = p.read_text()
@@ -123,6 +135,7 @@ jobs:
                   }
 
           '''
+          test = '\n'.join(line[10:] if line.startswith('                  ') else line for line in test.split('\n'))
           p.write_text(s.replace(marker, test + marker))
           PY
       - name: Check and test all Rego policies
@@ -140,9 +153,9 @@ jobs:
           from pathlib import Path
           import json, yaml
           root = Path('PowerShell/ScubaGear')
-          schema = json.loads((root / 'Modules/ScubaConfig/ScubaConfigSchema.json').read_text())
+          schema = json.loads((root / 'Modules/ScubaConfig/ScubaConfigSchema.json').read_text(encoding='utf-8-sig'))
           assert schema['schemaMetadata']['policyExclusionMappings']['MS.AAD.7.5v1'] == ['RoleExclusions']
-          baseline = json.loads((root / 'schemas/ScubaBaselines.json').read_text())
+          baseline = json.loads((root / 'schemas/ScubaBaselines.json').read_text(encoding='utf-8-sig'))
           policy = next(x for x in baseline['baselines']['aad'] if x['id'] == 'MS.AAD.7.5v1')
           assert policy['exclusionField'] == 'RoleExclusions'
           for name in ['full_config.yaml', 'scuba_compliance.yaml']:
