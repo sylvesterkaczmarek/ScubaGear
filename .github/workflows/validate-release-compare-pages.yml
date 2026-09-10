@@ -9,17 +9,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            shell: pwsh
-          - os: windows-latest
-            shell: powershell
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Prepare clean candidate
         shell: bash
         run: |
@@ -28,14 +27,13 @@ jobs:
           mkdir -p utils/workflow/Tests
           cp "$RUNNER_TEMP/pagination-tests.ps1" utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1
       - name: Install test tools
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
       - name: Reproduce original failure
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           Import-Module Pester -RequiredVersion 5.7.1
           $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
@@ -49,30 +47,25 @@ jobs:
           from pathlib import Path
           p = Path('utils/workflow/New-ReleaseNotes.ps1')
           source = p.read_text()
-          old = '''    $Comparison = Invoke-GitHubApi -Path "repos/$Owner/$Repository/compare/$BaseHead"
-              $CommitCount = 0
-              if ($Comparison.commits) {
-                  $CommitCount = @($Comparison.commits).Count
-              }
-              Write-Warning "Comparing $BaseHead : $CommitCount commits (status: $($Comparison.status))."
-
-              $PullRequestsByNumber = @{}
-              foreach ($Commit in @($Comparison.commits)) {'''
-          new = '''    $ComparisonPages = @(Invoke-GitHubApi `
-                  -Path "repos/$Owner/$Repository/compare/$BaseHead" `
-                  -Query @{ per_page = '100' } `
-                  -Paginate)
-              $Commits = @($ComparisonPages | ForEach-Object { $_.commits })
-              $CommitCount = $Commits.Count
-              Write-Warning "Comparing $BaseHead : $CommitCount commits (status: $($ComparisonPages[0].status))."
-
-              $PullRequestsByNumber = @{}
-              foreach ($Commit in $Commits) {'''
+          start = source.index('    $Comparison = Invoke-GitHubApi -Path "repos/$Owner/$Repository/compare/$BaseHead"')
+          end = source.index('    $PullRequestsByNumber = @{}', start)
+          replacement = '\n'.join([
+              '    $ComparisonPages = @(Invoke-GitHubApi `',
+              '        -Path "repos/$Owner/$Repository/compare/$BaseHead" `',
+              "        -Query @{ per_page = '100' } `",
+              '        -Paginate)',
+              '    $Commits = @($ComparisonPages | ForEach-Object { $_.commits })',
+              '    $CommitCount = $Commits.Count',
+              '    Write-Warning "Comparing $BaseHead : $CommitCount commits (status: $($ComparisonPages[0].status))."',
+              '', '',
+          ])
+          source = source[:start] + replacement + source[end:]
+          old = '    foreach ($Commit in @($Comparison.commits)) {'
           assert source.count(old) == 1
-          p.write_text(source.replace(old, new, 1))
+          p.write_text(source.replace(old, '    foreach ($Commit in $Commits) {', 1))
           PY
       - name: Run regression tests and compare analyzer findings
-        shell: ${{ matrix.shell }}
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Import-Module Pester -RequiredVersion 5.7.1
@@ -84,9 +77,21 @@ jobs:
           git show 7ef9501d7de9804ddb9d6013af6b665cccfb39d9:utils/workflow/New-ReleaseNotes.ps1 | Set-Content "$env:RUNNER_TEMP/OriginalReleaseNotes.ps1"
           $Before = @(Invoke-ScriptAnalyzer "$env:RUNNER_TEMP/OriginalReleaseNotes.ps1" -Severity Error,Warning | ForEach-Object { "$($_.RuleName):$($_.Message)" } | Sort-Object)
           $After = @(Invoke-ScriptAnalyzer utils/workflow/New-ReleaseNotes.ps1 -Severity Error,Warning | ForEach-Object { "$($_.RuleName):$($_.Message)" } | Sort-Object)
-          if (@(Compare-Object $Before $After).Count) { throw 'Production analyzer findings changed' }
+          if (($Before -join "`n") -cne ($After -join "`n")) { throw 'Production analyzer findings changed' }
+      - name: Validate Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider NuGet -Force -Scope CurrentUser
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+          Import-Module Pester -RequiredVersion 5.7.1
+          $PSVersionTable.PSVersion
+          $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
+          if ($Result.FailedCount -ne 0 -or $Result.PassedCount -ne 7) { throw 'PowerShell 5.1 regression tests failed' }
       - name: Publish clean tested branch
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           git diff --check
