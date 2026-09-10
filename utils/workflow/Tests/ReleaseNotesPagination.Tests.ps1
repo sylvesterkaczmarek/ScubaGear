@@ -75,7 +75,7 @@ Describe 'Release-note comparison pagination' {
         $script:TotalCommits = 301
         $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 301
-        $Result.PullRequestsByNumber.ContainsKey(301) | Should -BeTrue
+        $Result.PullRequestsByNumber.Values.number | Should -Contain 301
         $Result.HeadRef | Should -Be 'main'
         $Result.BaseHead | Should -Be 'v1.0.0...main'
         Should -Invoke Invoke-WebRequest -Times 4 -Exactly -ParameterFilter {
@@ -121,7 +121,7 @@ Describe 'Release-note comparison pagination' {
         $script:UnmergedCommit = 101
         $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 100
-        $Result.PullRequestsByNumber.ContainsKey(101) | Should -BeFalse
+        $Result.PullRequestsByNumber.Values.number | Should -Not -Contain 101
     }
 
     It 'fails instead of publishing partial notes when a later page fails' {
