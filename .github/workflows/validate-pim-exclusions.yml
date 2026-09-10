@@ -3,188 +3,24 @@ on:
   push:
     branches: [validation/2393-pim-exclusions]
 permissions:
-  contents: write
+  contents: read
 jobs:
-  validate:
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    defaults:
-      run:
-        shell: bash
-    env:
-      MODULE_ROOT: PowerShell/ScubaGear
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
       - uses: open-policy-agent/setup-opa@v2.4.0
-      - uses: open-policy-agent/setup-regal@v2.0.0
-      - name: Prepare clean candidate
+      - name: Inspect fixture and policy results
+        shell: bash
         run: |
-          cp "$MODULE_ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego" "$RUNNER_TEMP/pim-tests.rego"
-          git switch -c fix/2393-pim-role-exclusions 7ef9501d7de9804ddb9d6013af6b665cccfb39d9
-          cp "$RUNNER_TEMP/pim-tests.rego" "$MODULE_ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego"
-          opa version
-      - name: Reproduce ignored PIM exclusions
-        run: |
-          set +e
-          opa test "$MODULE_ROOT"/Rego/*.rego "$MODULE_ROOT"/Rego/Utils/*.rego "$MODULE_ROOT"/Testing/Unit/Rego/AAD/*.rego --run test_PimRoleExclusions_ -v > "$RUNNER_TEMP/before.log" 2>&1
-          result=$?
-          set -e
-          cat "$RUNNER_TEMP/before.log"
-          test "$result" -ne 0
+          ROOT=PowerShell/ScubaGear
+          opa eval --format pretty -d "$ROOT/Rego" -d "$ROOT/Testing/Unit/Rego/AAD" 'data.aad_test.PimPolicyResult([{"DisplayName":"Global Administrator","Assignments":[{"PrincipalId":"example","StartDateTime":"2026-09-09T00:00:00Z"}]}], {})'
+          opa eval --format pretty -d "$ROOT/Rego" -d "$ROOT/Testing/Unit/Rego/AAD" 'data.aad_test.PimPolicyResult([{"DisplayName":"Global Administrator","Assignments":[{"PrincipalId":"example","StartDateTime":null}]}], {})'
+          opa eval --format pretty -d "$ROOT/Rego" -d "$ROOT/Testing/Unit/Rego/AAD" 'data.utils.aad.Aad2P2Licenses with input as {"service_plans":data.aad_test.ServicePlans}'
+          opa test "$ROOT"/Rego/*.rego "$ROOT"/Rego/Utils/*.rego "$ROOT"/Testing/Unit/Rego/AAD/*.rego --run test_PimRoleExclusions_ --format=json > "$RUNNER_TEMP/results.json" || true
           python3 - <<'PY'
-          import os, re
+          import json, os
           from pathlib import Path
-          text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', (Path(os.environ['RUNNER_TEMP']) / 'before.log').read_text())
-          for name in ['User', 'Group']:
-              assert re.search(r'test_PimRoleExclusions_' + name + r':\s*FAIL\b', text), text
-          assert 'PASS:' in text, text
+          for t in json.loads((Path(os.environ['RUNNER_TEMP'])/'results.json').read_text()):
+              print(t['name'], 'FAIL' if t.get('fail') else 'PASS')
           PY
-          opa eval --format pretty -d "$MODULE_ROOT/Rego" -d "$MODULE_ROOT/Testing/Unit/Rego/AAD" 'data.aad_test.PimPolicyResult([{"DisplayName":"Global Administrator","Assignments":[{"PrincipalId":"example","StartDateTime":"2026-09-09T00:00:00Z"}]}], {})'
-      - name: Apply policy and configuration changes
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          root = Path('PowerShell/ScubaGear')
-          p = root / 'Rego/AADConfig.rego'
-          s = p.read_text()
-          pattern = r'RolesAssignedOutsidePim contains Role.DisplayName if \{\n.*?\n\}'
-          replacement = '''RolesAssignedOutsidePim contains Role.DisplayName if {
-              AllowedUsers := {User | some User in input.scuba_config.Aad["MS.AAD.7.5v1"].RoleExclusions.Users; is_string(User); User != ""}
-              AllowedGroups := {Group | some Group in input.scuba_config.Aad["MS.AAD.7.5v1"].RoleExclusions.Groups; is_string(Group); Group != ""}
-              some Role in input.privileged_roles
-              some Assignment in Role.Assignments
-              is_null(Assignment.StartDateTime)
-              Principal := object.get(Assignment, "PrincipalId", null)
-              not Principal in (AllowedUsers | AllowedGroups)
-          }'''
-          s, count = re.subn(pattern, replacement, s, flags=re.S)
-          assert count == 1, count
-          p.write_text(s)
-          p = root / 'Modules/ScubaConfig/ScubaConfigSchema.json'
-          s = p.read_text()
-          pattern = r'("MS\.AAD\.7\.4v1":\s*\[\s*"RoleExclusions"\s*\],)'
-          s, count = re.subn(pattern, r'\1\n      "MS.AAD.7.5v1": ["RoleExclusions"],', s)
-          assert count == 1, count
-          p.write_text(s)
-          p = root / 'baselines/aad.md'
-          s = p.read_text()
-          marker = '<!--Policy: MS.AAD.7.5v1; Criticality: SHALL -->'
-          assert s.count(marker) == 1
-          p.write_text(s.replace(marker, marker + '\n<!--ExclusionType: RoleExclusions-->'))
-          p = root / 'schemas/ScubaBaselines.json'
-          s = p.read_text(encoding='utf-8')
-          pattern = r'("id":\s*"MS\.AAD\.7\.5v1".*?"exclusionField":\s*)"none"'
-          s, count = re.subn(pattern, r'\1"RoleExclusions"', s, count=1, flags=re.S)
-          assert count == 1, count
-          p.write_text(s)
-          p = root / 'Modules/Support/Support.psm1'
-          s = p.read_text()
-          old = '$RoleExclusionNamespace = "MS.AAD.7.4v1"'
-          assert s.count(old) == 1
-          s = s.replace(old, '$RoleExclusionNamespace = @("MS.AAD.7.4v1", "MS.AAD.7.5v1")')
-          old = '    $AadTemplate.add($RoleExclusionNamespace, $AadRoleExclusions)'
-          assert s.count(old) == 1
-          s = s.replace(old, '    foreach ($Policy in $RoleExclusionNamespace) {\n        $AadTemplate.add($Policy, $AadRoleExclusions)\n    }')
-          p.write_text(s)
-          p = root / 'Sample-Config-Files/full_config.yaml'
-          s = p.read_text()
-          marker = '# EXCLUSIONS : EXO SAMPLE'
-          position = s.index(marker)
-          separator = s.rfind('# ========================', 0, position)
-          assert separator > 0
-          s = s[:separator] + '  # Provisioning to highly privileged roles SHALL occur through a PAM system.\n  MS.AAD.7.5v1: *CommonRoleExclusions\n\n' + s[separator:]
-          p.write_text(s)
-          p = root / 'Sample-Config-Files/scuba_compliance.yaml'
-          s = p.read_text()
-          pattern = r'(  MS\.AAD\.7\.4v1:\n.*?)(?=\n\S)'
-          match = re.search(pattern, s, flags=re.S)
-          assert match
-          block = match.group(1)
-          s = s[:match.end()] + '\n' + block.replace('MS.AAD.7.4v1', 'MS.AAD.7.5v1') + s[match.end():]
-          p.write_text(s)
-          p = Path('docs/configuration/configuration.md')
-          s = p.read_text()
-          old = '- MS.AAD.7.4v1\n'
-          assert s.count(old) == 1
-          new = (old + '- MS.AAD.7.5v1\n\n'
-                 'For `MS.AAD.7.5v1`, use the same `RoleExclusions.Users` and\n'
-                 '`RoleExclusions.Groups` structure shown above, under the `MS.AAD.7.5v1`\n'
-                 'key. Exclusions are scoped to each policy and match the assigned user or\n'
-                 'group ID. An exclusion for one assignment does not exempt other\n'
-                 'assignments to the same role.\n')
-          p.write_text(s.replace(old, new))
-          p = root / 'Testing/Unit/PowerShell/Support/New-SCuBAConfig.Tests.ps1'
-          s = p.read_text()
-          marker = '        Context "When policy IDs are provided in the OmitPolicy parameter" {'
-          assert s.count(marker) == 1
-          test = '''        It 'Includes user and group exclusions for both privileged-role policies' {
-                      Mock -ModuleName Support -CommandName ConvertTo-Yaml {
-                          $GeneratedConfig = $args[0]
-                          foreach ($PolicyId in @("MS.AAD.7.4v1", "MS.AAD.7.5v1")) {
-                              $GeneratedConfig["Aad"].Contains($PolicyId) | Should -BeTrue
-                              $GeneratedConfig["Aad"][$PolicyId].RoleExclusions.Users | Should -HaveCount 1
-                              $GeneratedConfig["Aad"][$PolicyId].RoleExclusions.Groups | Should -HaveCount 1
-                          }
-                          $GeneratedConfig
-                      }
-                      New-SCuBAConfig @CMDArgs
-                      Should -Invoke -CommandName ConvertTo-Yaml -Exactly -Times 1
-                  }
-
-          '''
-          test = '\n'.join(line[10:] if line.startswith('                  ') else line for line in test.split('\n'))
-          p.write_text(s.replace(marker, test + marker))
-          PY
-      - name: Check and test all Rego policies
-        run: |
-          opa fmt -w "$MODULE_ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego"
-          opa check "$MODULE_ROOT/Rego" "$MODULE_ROOT/Testing/Unit/Rego" --strict
-          opa test "$MODULE_ROOT"/Rego/*.rego "$MODULE_ROOT"/Rego/Utils/*.rego "$MODULE_ROOT"/Testing/Unit/Rego/**/*.rego -v > "$RUNNER_TEMP/opa.log" 2>&1 || { tail -100 "$RUNNER_TEMP/opa.log"; exit 1; }
-          grep 'PimRoleExclusions_' "$RUNNER_TEMP/opa.log"
-          tail -5 "$RUNNER_TEMP/opa.log"
-          regal lint --format compact "$MODULE_ROOT/Rego/AADConfig.rego" "$MODULE_ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego"
-      - name: Verify configuration metadata and sample YAML
-        run: |
-          python3 -m pip install pyyaml
-          python3 - <<'PY'
-          from pathlib import Path
-          import json, yaml
-          root = Path('PowerShell/ScubaGear')
-          schema = json.loads((root / 'Modules/ScubaConfig/ScubaConfigSchema.json').read_text(encoding='utf-8-sig'))
-          assert schema['schemaMetadata']['policyExclusionMappings']['MS.AAD.7.5v1'] == ['RoleExclusions']
-          baseline = json.loads((root / 'schemas/ScubaBaselines.json').read_text(encoding='utf-8-sig'))
-          policy = next(x for x in baseline['baselines']['aad'] if x['id'] == 'MS.AAD.7.5v1')
-          assert policy['exclusionField'] == 'RoleExclusions'
-          for name in ['full_config.yaml', 'scuba_compliance.yaml']:
-              obj = yaml.safe_load((root / 'Sample-Config-Files' / name).read_text())
-              assert obj['Aad']['MS.AAD.7.5v1']['RoleExclusions'] == obj['Aad']['MS.AAD.7.4v1']['RoleExclusions']
-          print('Schema mapping, app metadata and both YAML samples verified.')
-          PY
-      - name: Test PowerShell configuration generation
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser
-          Import-Module Pester -RequiredVersion 5.7.1
-          $result = Invoke-Pester -Path "$env:MODULE_ROOT/Testing/Unit/PowerShell/Support/New-SCuBAConfig.Tests.ps1" -PassThru -Output Detailed
-          if ($result.FailedCount -gt 0 -or $result.PassedCount -lt 5) { throw 'Configuration generation tests failed' }
-          Copy-Item "$env:MODULE_ROOT/schemas/ScubaBaselines.json" "$env:RUNNER_TEMP/ScubaBaselines.json"
-          & ./utils/workflow/Generate-ScubaBaseline.ps1 -OutputPath "$env:RUNNER_TEMP/ScubaBaselines.json" -Validate
-          $generated = Get-Content "$env:RUNNER_TEMP/ScubaBaselines.json" -Raw | ConvertFrom-Json
-          $policy = $generated.baselines.aad | Where-Object id -EQ 'MS.AAD.7.5v1'
-          if ($policy.exclusionField -ne 'RoleExclusions') { throw 'Regeneration lost the PIM exclusions metadata' }
-      - name: Publish clean tested branch
-        run: |
-          git diff --check
-          git diff --stat
-          git add "$MODULE_ROOT/Rego/AADConfig.rego" "$MODULE_ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego" "$MODULE_ROOT/Modules/ScubaConfig/ScubaConfigSchema.json" "$MODULE_ROOT/baselines/aad.md" "$MODULE_ROOT/schemas/ScubaBaselines.json" "$MODULE_ROOT/Modules/Support/Support.psm1" "$MODULE_ROOT/Sample-Config-Files/full_config.yaml" "$MODULE_ROOT/Sample-Config-Files/scuba_compliance.yaml" "$MODULE_ROOT/Testing/Unit/PowerShell/Support/New-SCuBAConfig.Tests.ps1" docs/configuration/configuration.md
-          git diff --cached --check
-          git config user.name 'Sylvester Kaczmarek'
-          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
-          git commit -s -m 'Support user and group exclusions for outside-PIM role assignments'
-          git push origin HEAD:refs/heads/fix/2393-pim-role-exclusions
-          git show --stat --oneline HEAD
