@@ -1,6 +1,6 @@
 BeforeAll {
     . (Join-Path $PSScriptRoot '../New-ReleaseNotes.ps1')
-    $CompareArgs = @{
+    $script:CompareArgs = @{
         Owner = 'example'
         Repository = 'release'
         PreviousTag = 'v1.0.0'
@@ -73,7 +73,7 @@ Describe 'Release-note comparison pagination' {
 
     It 'includes all 301 commits across four comparison pages' {
         $script:TotalCommits = 301
-        $Result = Get-MergedPullRequestsForCompare @CompareArgs
+        $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 301
         $Result.PullRequestsByNumber.ContainsKey(301) | Should -BeTrue
         $Result.HeadRef | Should -Be 'main'
@@ -84,7 +84,7 @@ Describe 'Release-note comparison pagination' {
     }
 
     It 'handles an empty comparison without querying a null commit' {
-        $Result = Get-MergedPullRequestsForCompare @CompareArgs
+        $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 0
         Should -Invoke Invoke-WebRequest -Times 0 -Exactly -ParameterFilter {
             ([uri]$Uri).AbsolutePath -like '*/commits/*/pulls'
@@ -93,13 +93,13 @@ Describe 'Release-note comparison pagination' {
 
     It 'handles a single commit' {
         $script:TotalCommits = 1
-        $Result = Get-MergedPullRequestsForCompare @CompareArgs
+        $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 1
     }
 
     It 'stops at an exact page boundary' {
         $script:TotalCommits = 100
-        $Result = Get-MergedPullRequestsForCompare @CompareArgs
+        $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 100
         Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
             ([uri]$Uri).AbsolutePath -like '*/compare/*'
@@ -109,7 +109,7 @@ Describe 'Release-note comparison pagination' {
     It 'deduplicates pull requests associated with multiple pages' {
         $script:TotalCommits = 101
         $script:DuplicatePullRequest = $true
-        $Result = Get-MergedPullRequestsForCompare @CompareArgs
+        $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 1
         Should -Invoke Invoke-WebRequest -Times 101 -Exactly -ParameterFilter {
             ([uri]$Uri).AbsolutePath -like '*/commits/*/pulls'
@@ -119,7 +119,7 @@ Describe 'Release-note comparison pagination' {
     It 'excludes unmerged pull requests on later pages' {
         $script:TotalCommits = 101
         $script:UnmergedCommit = 101
-        $Result = Get-MergedPullRequestsForCompare @CompareArgs
+        $Result = Get-MergedPullRequestsForCompare @script:CompareArgs
         $Result.PullRequestsByNumber.Count | Should -Be 100
         $Result.PullRequestsByNumber.ContainsKey(101) | Should -BeFalse
     }
@@ -127,6 +127,6 @@ Describe 'Release-note comparison pagination' {
     It 'fails instead of publishing partial notes when a later page fails' {
         $script:TotalCommits = 301
         $script:FailSecondPage = $true
-        { Get-MergedPullRequestsForCompare @CompareArgs } | Should -Throw '*Second comparison page unavailable*'
+        { Get-MergedPullRequestsForCompare @script:CompareArgs } | Should -Throw '*Second comparison page unavailable*'
     }
 }
