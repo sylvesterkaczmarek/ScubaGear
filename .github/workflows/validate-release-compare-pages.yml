@@ -1,0 +1,98 @@
+name: Validate release comparison pagination
+on:
+  push:
+    branches: [validation/release-compare-pages]
+permissions:
+  contents: write
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: pwsh
+          - os: windows-latest
+            shell: powershell
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Prepare clean candidate
+        shell: bash
+        run: |
+          cp utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 "$RUNNER_TEMP/pagination-tests.ps1"
+          git switch -c fix/release-compare-pages 7ef9501d7de9804ddb9d6013af6b665cccfb39d9
+          mkdir -p utils/workflow/Tests
+          cp "$RUNNER_TEMP/pagination-tests.ps1" utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1
+      - name: Install test tools
+        shell: ${{ matrix.shell }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+      - name: Reproduce original failure
+        shell: ${{ matrix.shell }}
+        run: |
+          Import-Module Pester -RequiredVersion 5.7.1
+          $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
+          if ($Result.FailedCount -lt 2 -or $Result.PassedCount -lt 4) {
+              throw "Unexpected baseline outcome: $($Result.FailedCount) failures, $($Result.PassedCount) passes"
+          }
+      - name: Apply pagination fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('utils/workflow/New-ReleaseNotes.ps1')
+          source = p.read_text()
+          old = '''    $Comparison = Invoke-GitHubApi -Path "repos/$Owner/$Repository/compare/$BaseHead"
+              $CommitCount = 0
+              if ($Comparison.commits) {
+                  $CommitCount = @($Comparison.commits).Count
+              }
+              Write-Warning "Comparing $BaseHead : $CommitCount commits (status: $($Comparison.status))."
+
+              $PullRequestsByNumber = @{}
+              foreach ($Commit in @($Comparison.commits)) {'''
+          new = '''    $ComparisonPages = @(Invoke-GitHubApi `
+                  -Path "repos/$Owner/$Repository/compare/$BaseHead" `
+                  -Query @{ per_page = '100' } `
+                  -Paginate)
+              $Commits = @($ComparisonPages | ForEach-Object { $_.commits })
+              $CommitCount = $Commits.Count
+              Write-Warning "Comparing $BaseHead : $CommitCount commits (status: $($ComparisonPages[0].status))."
+
+              $PullRequestsByNumber = @{}
+              foreach ($Commit in $Commits) {'''
+          assert source.count(old) == 1
+          p.write_text(source.replace(old, new, 1))
+          PY
+      - name: Run regression tests and compare analyzer findings
+        shell: ${{ matrix.shell }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module Pester -RequiredVersion 5.7.1
+          $PSVersionTable.PSVersion
+          $Result = Invoke-Pester -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -PassThru -Output Detailed
+          if ($Result.FailedCount -ne 0 -or $Result.PassedCount -ne 7) { throw 'Regression tests failed' }
+          $Findings = @(Invoke-ScriptAnalyzer -Path utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1 -Severity Error,Warning)
+          if ($Findings.Count) { $Findings | Format-List; throw 'New test analyzer findings' }
+          git show 7ef9501d7de9804ddb9d6013af6b665cccfb39d9:utils/workflow/New-ReleaseNotes.ps1 | Set-Content "$env:RUNNER_TEMP/OriginalReleaseNotes.ps1"
+          $Before = @(Invoke-ScriptAnalyzer "$env:RUNNER_TEMP/OriginalReleaseNotes.ps1" -Severity Error,Warning | ForEach-Object { "$($_.RuleName):$($_.Message)" } | Sort-Object)
+          $After = @(Invoke-ScriptAnalyzer utils/workflow/New-ReleaseNotes.ps1 -Severity Error,Warning | ForEach-Object { "$($_.RuleName):$($_.Message)" } | Sort-Object)
+          if (@(Compare-Object $Before $After).Count) { throw 'Production analyzer findings changed' }
+      - name: Publish clean tested branch
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          git diff --check
+          git add utils/workflow/New-ReleaseNotes.ps1 utils/workflow/Tests/ReleaseNotesPagination.Tests.ps1
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git commit -s -m 'Include every comparison page in release notes'
+          git push origin HEAD:refs/heads/fix/release-compare-pages
+          git log -1 --format='%H %s'
