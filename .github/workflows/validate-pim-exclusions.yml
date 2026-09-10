@@ -3,24 +3,100 @@ on:
   push:
     branches: [validation/2393-pim-exclusions]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  inspect:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      ROOT: PowerShell/ScubaGear
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: open-policy-agent/setup-opa@v2.4.0
-      - name: Inspect fixture and policy results
-        shell: bash
+      - uses: open-policy-agent/setup-regal@v2.0.0
+      - name: Prepare isolated candidate
         run: |
-          ROOT=PowerShell/ScubaGear
-          opa eval --format pretty -d "$ROOT/Rego" -d "$ROOT/Testing/Unit/Rego/AAD" 'data.aad_test.PimPolicyResult([{"DisplayName":"Global Administrator","Assignments":[{"PrincipalId":"example","StartDateTime":"2026-09-09T00:00:00Z"}]}], {})'
-          opa eval --format pretty -d "$ROOT/Rego" -d "$ROOT/Testing/Unit/Rego/AAD" 'data.aad_test.PimPolicyResult([{"DisplayName":"Global Administrator","Assignments":[{"PrincipalId":"example","StartDateTime":null}]}], {})'
-          opa eval --format pretty -d "$ROOT/Rego" -d "$ROOT/Testing/Unit/Rego/AAD" 'data.utils.aad.Aad2P2Licenses with input as {"service_plans":data.aad_test.ServicePlans}'
-          opa test "$ROOT"/Rego/*.rego "$ROOT"/Rego/Utils/*.rego "$ROOT"/Testing/Unit/Rego/AAD/*.rego --run test_PimRoleExclusions_ --format=json > "$RUNNER_TEMP/results.json" || true
+          cp "$ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego" "$RUNNER_TEMP/pim-tests.rego"
+          cp .validation/apply-pim-exclusions.py "$RUNNER_TEMP/apply.py"
+          git switch -c fix/2393-pim-role-exclusions 7ef9501d7de9804ddb9d6013af6b665cccfb39d9
+          cp "$RUNNER_TEMP/pim-tests.rego" "$ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego"
+          opa version
+      - name: Reproduce missing exclusions
+        run: |
+          set +e
+          opa test "$ROOT/Rego" "$ROOT/Testing/Unit/Rego/AAD" --run test_PimRoleExclusions_ --format=json > "$RUNNER_TEMP/before.json"
+          result=$?
+          set -e
+          test "$result" -ne 0
           python3 - <<'PY'
           import json, os
           from pathlib import Path
-          for t in json.loads((Path(os.environ['RUNNER_TEMP'])/'results.json').read_text()):
-              print(t['name'], 'FAIL' if t.get('fail') else 'PASS')
+          results = json.loads((Path(os.environ['RUNNER_TEMP']) / 'before.json').read_text())
+          failed = [x['name'] for x in results if x.get('fail')]
+          assert 'test_PimRoleExclusions_User' in failed
+          assert 'test_PimRoleExclusions_Group' in failed
+          assert any(x['name']=='test_PimRoleExclusions_PimAssignmentsStillPass' and not x.get('fail') for x in results)
+          print('Baseline:', len(failed), 'failed;', len(results)-len(failed), 'passed')
+          print('\n'.join(failed))
           PY
+      - name: Apply focused changes
+        run: python3 "$RUNNER_TEMP/apply.py"
+      - name: Verify Rego policy suite
+        run: |
+          opa fmt -w "$ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego"
+          opa check "$ROOT/Rego" "$ROOT/Testing/Unit/Rego" --strict
+          opa test "$ROOT/Rego" "$ROOT/Testing/Unit/Rego" --format=json > "$RUNNER_TEMP/after.json" || { python3 -c 'import json,os; from pathlib import Path; print(json.dumps([x for x in json.loads((Path(os.environ["RUNNER_TEMP"])/"after.json").read_text()) if x.get("fail") or x.get("error")],indent=2))'; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          results = json.loads((Path(os.environ['RUNNER_TEMP'])/'after.json').read_text())
+          print('Full Rego suite:', len(results), 'passed')
+          print('New PIM tests:', len([x for x in results if 'test_PimRoleExclusions_' in x['name']]))
+          PY
+          regal lint --format compact "$ROOT/Rego/AADConfig.rego" "$ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego"
+      - name: Verify configuration integration
+        run: |
+          python3 -m pip install pyyaml
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, yaml
+          root=Path('PowerShell/ScubaGear')
+          schema=json.loads((root/'Modules/ScubaConfig/ScubaConfigSchema.json').read_text(encoding='utf-8-sig'))
+          assert schema['schemaMetadata']['policyExclusionMappings']['MS.AAD.7.5v1']==['RoleExclusions']
+          baselines=json.loads((root/'schemas/ScubaBaselines.json').read_text(encoding='utf-8-sig'))
+          policy=next(x for x in baselines['baselines']['aad'] if x['id']=='MS.AAD.7.5v1')
+          assert policy['exclusionField']=='RoleExclusions'
+          for filename in ['full_config.yaml','scuba_compliance.yaml']:
+              config=yaml.safe_load((root/'Sample-Config-Files'/filename).read_text())
+              assert config['Aad']['MS.AAD.7.5v1']['RoleExclusions']==config['Aad']['MS.AAD.7.4v1']['RoleExclusions']
+          print('Schema, configuration-app metadata and both YAML samples pass.')
+          PY
+      - name: Verify PowerShell generation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser
+          Import-Module Pester -RequiredVersion 5.7.1
+          $result = Invoke-Pester -Path "$env:ROOT/Testing/Unit/PowerShell/Support/New-SCuBAConfig.Tests.ps1" -PassThru -Output Detailed
+          if ($result.FailedCount -gt 0 -or $result.PassedCount -lt 5) { throw 'Configuration generation tests failed' }
+          Copy-Item "$env:ROOT/schemas/ScubaBaselines.json" "$env:RUNNER_TEMP/ScubaBaselines.json"
+          & ./utils/workflow/Generate-ScubaBaseline.ps1 -OutputPath "$env:RUNNER_TEMP/ScubaBaselines.json" -Validate
+          $generated = Get-Content "$env:RUNNER_TEMP/ScubaBaselines.json" -Raw | ConvertFrom-Json
+          $policy = $generated.baselines.aad | Where-Object id -EQ 'MS.AAD.7.5v1'
+          if ($policy.exclusionField -ne 'RoleExclusions') { throw 'Regenerated metadata lost exclusions' }
+      - name: Publish only tested changes
+        run: |
+          git diff --check
+          git add "$ROOT/Rego/AADConfig.rego" "$ROOT/Testing/Unit/Rego/AAD/AADConfig_07_exclusions_test.rego" "$ROOT/Modules/ScubaConfig/ScubaConfigSchema.json" "$ROOT/baselines/aad.md" "$ROOT/schemas/ScubaBaselines.json" "$ROOT/Modules/Support/Support.psm1" "$ROOT/Sample-Config-Files/full_config.yaml" "$ROOT/Sample-Config-Files/scuba_compliance.yaml" "$ROOT/Testing/Unit/PowerShell/Support/New-SCuBAConfig.Tests.ps1" docs/configuration/configuration.md
+          git diff --cached --check
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git commit -s -m 'Support exclusions for outside-PIM privileged role assignments'
+          git push origin HEAD:refs/heads/fix/2393-pim-role-exclusions
+          git show --stat --oneline HEAD
