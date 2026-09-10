@@ -1,0 +1,47 @@
+name: Validate PIM role exclusions
+on:
+  push:
+    branches: [validation/2393-pim-exclusions]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Inspect exclusion integration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          targets = {
+            'PowerShell/ScubaGear/Modules/Support/Support.psm1': 'MS.AAD.7.4v1',
+            'PowerShell/ScubaGear/Sample-Config-Files/full_config.yaml': 'MS.AAD.7.4v1',
+            'PowerShell/ScubaGear/Sample-Config-Files/scuba_compliance.yaml': 'MS.AAD.7.4v1',
+            'docs/configuration/configuration.md': 'MS.AAD.7.4v1',
+            'PowerShell/ScubaGear/baselines/aad.md': '#### MS.AAD.7.5v1',
+          }
+          for filename, needle in targets.items():
+              lines = Path(filename).read_text().splitlines()
+              print('\nFILE', filename)
+              for i,line in enumerate(lines):
+                  if needle in line:
+                      print('\n'.join(f'{j+1}: {lines[j]}' for j in range(max(0,i-3),min(len(lines),i+15))))
+          p = Path('PowerShell/ScubaGear/schemas/ScubaBaselines.json')
+          obj = json.loads(p.read_text(encoding='utf-8-sig'))
+          for product, policies in obj['baselines'].items():
+              for policy in policies:
+                  if policy.get('id') in ('MS.AAD.7.4v1','MS.AAD.7.5v1'):
+                      print('\nSCHEMA', product, json.dumps(policy))
+          for p in Path('.github').rglob('*'):
+              if p.is_file():
+                  lines = p.read_text().splitlines()
+                  for i,line in enumerate(lines):
+                      if 'opa test' in line.lower() or 'opa-version' in line.lower() or 'opa-version' in str(p):
+                          print(str(p), i+1, '\n'.join(lines[max(0,i-2):i+4]))
+          for p in [Path('PowerShell/ScubaGear/Modules/Support/Support.psm1'),Path('PowerShell/ScubaGear/ScubaGear.psd1')]:
+              lines=p.read_text().splitlines()
+              for i,line in enumerate(lines):
+                  if 'OPAVersion' in line:
+                      print(str(p),i+1,'\n'.join(lines[max(0,i-2):i+4]))
+          PY
